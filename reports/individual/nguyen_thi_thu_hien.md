@@ -6,7 +6,7 @@
 
 **Nhóm:** 30  
 
-**Vai trò trong nhóm:** Retrieval Owner (Phụ trách Indexing & Embedding)
+**Vai trò trong nhóm:** Retrieval Owner (Phụ trách phần Indexing & Embedding)
 
 **Ngày nộp:** 13/04/2026 
 
