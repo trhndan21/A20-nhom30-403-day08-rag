@@ -92,7 +92,15 @@ def retrieve_dense(query: str, top_k: int = TOP_K_SEARCH) -> List[Dict[str, Any]
     from index import get_embedding, CHROMA_DB_DIR
 
     client = chromadb.PersistentClient(path=str(CHROMA_DB_DIR))
-    collection = client.get_collection("rag_lab")
+    collection = client.get_or_create_collection(
+        name="rag_lab",
+        metadata={"hnsw:space": "cosine"},
+    )
+
+    if collection.count() == 0:
+        raise RuntimeError(
+            "Collection 'rag_lab' trống. Hãy chạy 'python index.py' trước để build index."
+        )
 
     query_embedding = get_embedding(query)
     results = collection.query(
@@ -134,7 +142,16 @@ def retrieve_sparse(query: str, top_k: int = TOP_K_SEARCH) -> List[Dict[str, Any
 
     # Load toàn bộ corpus từ ChromaDB
     client = chromadb.PersistentClient(path=str(CHROMA_DB_DIR))
-    collection = client.get_collection("rag_lab")
+    collection = client.get_or_create_collection(
+        name="rag_lab",
+        metadata={"hnsw:space": "cosine"},
+    )
+
+    if collection.count() == 0:
+        raise RuntimeError(
+            "Collection 'rag_lab' trống. Hãy chạy 'python index.py' trước để build index."
+        )
+
     all_data = collection.get(include=["documents", "metadatas"])
 
     all_docs = all_data["documents"]
@@ -443,54 +460,39 @@ def build_grounded_prompt(query: str, context_block: str) -> str:
     3. Citation: Gắn source/section khi có thể
     4. Short, clear, stable: Output ngắn, rõ, nhất quán
 
-    TODO Sprint 2:
-    Đây là prompt baseline. Trong Sprint 3, bạn có thể:
-    - Thêm hướng dẫn về format output (JSON, bullet points)
-    - Thêm ngôn ngữ phản hồi (tiếng Việt vs tiếng Anh)
-    - Điều chỉnh tone phù hợp với use case (CS helpdesk, IT support)
+    Trả về JSON gồm:
+      - "answer": câu trả lời với citation [N]
+      - "grounded_spans": list các câu/cụm từ NGUYÊN VĂN từ context đã dùng
     """
     prompt = f"""Answer only from the retrieved context below.
 If the context is insufficient to answer the question, say you do not know and do not make up information.
-Cite the source field (in brackets like [1]) when possible.
+Cite the source (in brackets like [1]) when using information from a chunk.
 Keep your answer short, clear, and factual.
 Respond in the same language as the question.
+
+You MUST return a JSON object with exactly these two fields:
+{{
+  "answer": "<your grounded answer with [N] citations>",
+  "grounded_spans": ["<exact phrase or sentence copied verbatim from the context that you relied on>", ...]
+}}
 
 Question: {query}
 
 Context:
-{context_block}
-
-Answer:"""
+{context_block}"""
     return prompt
 
 
-def call_llm(prompt: str) -> str:
+def call_llm(prompt: str) -> Tuple[str, List[str]]:
     """
-    Gọi LLM để sinh câu trả lời.
+    Gọi LLM, parse JSON response.
 
-    TODO Sprint 2:
-    Chọn một trong hai:
-
-    Option A — OpenAI (cần OPENAI_API_KEY):
-        from openai import OpenAI
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        response = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,     # temperature=0 để output ổn định, dễ đánh giá
-            max_tokens=512,
-        )
-        return response.choices[0].message.content
-
-    Option B — Google Gemini (cần GOOGLE_API_KEY):
-        import google.generativeai as genai
-        genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        response = model.generate_content(prompt)
-        return response.text
-
-    Lưu ý: Dùng temperature=0 hoặc thấp để output ổn định cho evaluation.
+    Returns:
+        (answer, grounded_spans)
+          - answer: câu trả lời với citation [N]
+          - grounded_spans: list câu/cụm từ nguyên văn từ context đã dùng
     """
+    import json
     from openai import OpenAI
 
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -498,9 +500,22 @@ def call_llm(prompt: str) -> str:
         model=LLM_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0,
-        max_tokens=512,
+        max_tokens=768,
+        response_format={"type": "json_object"},
     )
-    return response.choices[0].message.content
+    raw = response.choices[0].message.content or ""
+    try:
+        data = json.loads(raw)
+        answer = data.get("answer", raw)
+        grounded_spans = data.get("grounded_spans", [])
+        if not isinstance(grounded_spans, list):
+            grounded_spans = []
+        # Lọc span rỗng
+        grounded_spans = [s for s in grounded_spans if isinstance(s, str) and s.strip()]
+    except (json.JSONDecodeError, AttributeError):
+        answer = raw
+        grounded_spans = []
+    return answer, grounded_spans
 
 
 def rag_answer(
@@ -598,7 +613,7 @@ def rag_answer(
         print(f"\n[RAG] Prompt:\n{prompt[:500]}...\n")
 
     # --- Bước 4: Generate ---
-    answer = call_llm(prompt)
+    answer, grounded_spans = call_llm(prompt)
 
     # --- Bước 5: Extract sources ---
     sources = list({
@@ -609,6 +624,7 @@ def rag_answer(
     return {
         "query": query,
         "answer": answer,
+        "grounded_spans": grounded_spans,
         "sources": sources,
         "chunks_used": candidates,
         "config": config,
@@ -650,6 +666,65 @@ def compare_retrieval_strategies(query: str) -> None:
 
 
 # =============================================================================
+# GROUNDING HIGHLIGHT HELPERS
+# =============================================================================
+
+def _highlight_chunk_html(
+    chunk_idx: int,
+    chunk: Dict[str, Any],
+    grounded_spans: List[str],
+) -> str:
+    """
+    Render một chunk thành HTML, tô màu vàng những câu/cụm từ
+    có trong grounded_spans (nguyên văn từ LLM).
+
+    Màu vàng (#ffe066) = câu đóng góp trực tiếp vào câu trả lời.
+    """
+    import html as _html
+
+    meta = chunk.get("metadata", {})
+    score = chunk.get("score", 0)
+    src = meta.get("source", "?")
+    sec = meta.get("section", "")
+    text = chunk.get("text", "")
+
+    header = f"<b>[{chunk_idx}]</b> <code>{_html.escape(src)}</code>"
+    if sec:
+        header += f" | <i>{_html.escape(sec)}</i>"
+    header += f" | score={score:.3f}"
+
+    # Escape toàn bộ text, sau đó tô màu từng span
+    escaped = _html.escape(text)
+    highlighted_count = 0
+    for span in grounded_spans:
+        span = span.strip()
+        if not span:
+            continue
+        escaped_span = _html.escape(span)
+        if escaped_span in escaped:
+            escaped = escaped.replace(
+                escaped_span,
+                f'<mark style="background:#ffe066;padding:1px 3px;border-radius:3px">'
+                f'{escaped_span}</mark>',
+                1,
+            )
+            highlighted_count += 1
+
+    # Dấu hiệu chunk có đóng góp
+    border_color = "#f5a623" if highlighted_count > 0 else "#ddd"
+    body = escaped.replace("\n", "<br>")
+
+    return (
+        f'<div style="margin-bottom:14px;padding:10px 12px;'
+        f'border-left:4px solid {border_color};border-radius:4px;'
+        f'background:#fafafa">'
+        f'<p style="margin:0 0 6px;font-size:0.85em;color:#555">{header}</p>'
+        f'<p style="margin:0;font-size:0.88em;line-height:1.6">{body}</p>'
+        f'</div>'
+    )
+
+
+# =============================================================================
 # MAIN — Chatbot UI (Gradio)
 # =============================================================================
 
@@ -678,7 +753,7 @@ def _chat_fn(
     Hàm xử lý mỗi lượt chat, trả về:
       - history mới (cho Chatbot component)
       - sources markdown
-      - chunks markdown (debug)
+      - chunks HTML (có highlight câu đóng góp)
     """
     if not query.strip():
         return history, "", ""
@@ -695,6 +770,7 @@ def _chat_fn(
         answer = result["answer"]
         sources = result["sources"]
         chunks = result["chunks_used"]
+        grounded_spans = result.get("grounded_spans", [])
 
         # --- Format sources ---
         if sources:
@@ -702,31 +778,31 @@ def _chat_fn(
         else:
             src_md = "_Không có source_"
 
-        # --- Format chunks (debug panel) ---
-        chunk_lines = []
-        for i, c in enumerate(chunks, 1):
-            meta = c.get("metadata", {})
-            score = c.get("score", 0)
-            src = meta.get("source", "?")
-            sec = meta.get("section", "")
-            preview = c.get("text", "")[:200].replace("\n", " ")
-            chunk_lines.append(
-                f"**[{i}]** `{src}`"
-                + (f" | _{sec}_" if sec else "")
-                + f" | score={score:.3f}\n> {preview}…"
+        # --- Format chunks với highlight ---
+        if chunks:
+            chunk_html_parts = [
+                _highlight_chunk_html(i, c, grounded_spans)
+                for i, c in enumerate(chunks, 1)
+            ]
+            legend = (
+                '<p style="font-size:0.8em;color:#888;margin:0 0 10px">'
+                '<mark style="background:#ffe066;padding:1px 4px;border-radius:3px">▌</mark>'
+                " = câu trực tiếp đóng góp vào câu trả lời</p>"
             )
-        chunks_md = "\n\n".join(chunk_lines) if chunk_lines else "_Không có chunk_"
+            chunks_html = legend + "".join(chunk_html_parts)
+        else:
+            chunks_html = "<i>Không có chunk</i>"
 
     except Exception as e:
         answer = f"Lỗi: {e}"
         src_md = ""
-        chunks_md = ""
+        chunks_html = ""
 
     history = history + [
         {"role": "user", "content": query},
         {"role": "assistant", "content": answer},
     ]
-    return history, src_md, chunks_md
+    return history, src_md, chunks_html
 
 
 def launch_chatbot() -> None:
@@ -790,8 +866,8 @@ def launch_chatbot() -> None:
                 gr.Markdown("### Sources")
                 sources_box = gr.Markdown(value="_Chưa có câu hỏi_")
 
-                with gr.Accordion("Chunks debug (score + preview)", open=False):
-                    chunks_box = gr.Markdown(value="")
+                with gr.Accordion("Chunks debug (câu highlight = đóng góp vào trả lời)", open=False):
+                    chunks_box = gr.HTML(value="")
 
         # ── State ─────────────────────────────────────────────────────────────
         state_history = gr.State([])
