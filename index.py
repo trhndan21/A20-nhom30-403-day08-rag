@@ -108,7 +108,11 @@ def chunk_document(doc: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 # STEP 3: EMBED + STORE
 def get_embedding(text: str) -> List[float]:
-    return embedding_model.encode(text).tolist()
+    from sentence_transformers import SentenceTransformer
+    if not hasattr(get_embedding, "_model"):
+        get_embedding._model = SentenceTransformer("all-MiniLM-L6-v2")
+    return get_embedding._model.encode(text, normalize_embeddings=True).tolist()
+
 
 def build_index(docs_dir: Path = DOCS_DIR, db_dir: Path = CHROMA_DB_DIR) -> None:
     print(f"🚀 Bắt đầu Indexing tài liệu vào: {db_dir}")
