@@ -1,106 +1,69 @@
-# Tuning Log — RAG Pipeline (Day 08 Lab)
+# Nhật Ký Tinh Chỉnh Pipeline RAG
 
-> Template: Ghi lại mỗi thay đổi và kết quả quan sát được.
-> A/B Rule: Chỉ đổi MỘT biến mỗi lần.
+## 1. Cấu hình baseline
 
----
+Ngày chạy: 2026-04-13
 
-## Baseline (Sprint 2)
-
-**Ngày:** ___________  
-**Config:**
-```
-retrieval_mode = "dense"
-chunk_size = _____ tokens
-overlap = _____ tokens
+```text
+retrieval_mode = dense
+chunk_size = 400
+overlap = 80
 top_k_search = 10
 top_k_select = 3
 use_rerank = False
-llm_model = _____
+llm_model = gpt-4o-mini
 ```
 
-**Scorecard Baseline:**
-| Metric | Average Score |
-|--------|--------------|
-| Faithfulness | ? /5 |
-| Answer Relevance | ? /5 |
-| Context Recall | ? /5 |
-| Completeness | ? /5 |
+Điểm trung bình baseline:
 
-**Câu hỏi yếu nhất (điểm thấp):**
-> TODO: Liệt kê 2-3 câu hỏi có điểm thấp nhất và lý do tại sao.
-> Ví dụ: "q07 (Approval Matrix) - context recall = 1/5 vì dense bỏ lỡ alias."
+| Chỉ số | Điểm |
+|---|---|
+| Faithfulness | 4.70/5 |
+| Relevance | 4.80/5 |
+| Context Recall | 5.00/5 |
+| Completeness | 4.20/5 |
 
-**Giả thuyết nguyên nhân (Error Tree):**
-- [ ] Indexing: Chunking cắt giữa điều khoản
-- [ ] Indexing: Metadata thiếu effective_date
-- [ ] Retrieval: Dense bỏ lỡ exact keyword / alias
-- [ ] Retrieval: Top-k quá ít → thiếu evidence
-- [ ] Generation: Prompt không đủ grounding
-- [ ] Generation: Context quá dài → lost in the middle
+Các câu cần cải thiện trong baseline:
 
----
+1. q10: đúng hướng từ chối do thiếu dữ liệu, nhưng thiếu nêu rõ quy trình chuẩn liên quan.
+2. q04: trả lời đúng chính sách chính, nhưng thiếu chi tiết diễn giải đầy đủ về ngoại lệ.
+3. q07: chưa nêu rõ thông tin đổi tên tài liệu trong phần trả lời.
 
-## Variant 1 (Sprint 3)
+## 2. Cấu hình variant
 
-**Ngày:** ___________  
-**Biến thay đổi:** ___________  
-**Lý do chọn biến này:**
-> TODO: Giải thích theo evidence từ baseline results.
-> Ví dụ: "Chọn hybrid vì q07 (alias query) và q09 (mã lỗi ERR-403) đều thất bại với dense.
-> Corpus có cả ngôn ngữ tự nhiên (policy) lẫn tên riêng/mã lỗi (ticket code, SLA label)."
+Ngày chạy: 2026-04-13
 
-**Config thay đổi:**
-```
-retrieval_mode = "hybrid"   # hoặc biến khác
-# Các tham số còn lại giữ nguyên như baseline
+```text
+retrieval_mode = hybrid
+chunk_size = 400
+overlap = 80
+top_k_search = 10
+top_k_select = 3
+use_rerank = True
+llm_model = gpt-4o-mini
 ```
 
-**Scorecard Variant 1:**
-| Metric | Baseline | Variant 1 | Delta |
-|--------|----------|-----------|-------|
-| Faithfulness | ?/5 | ?/5 | +/- |
-| Answer Relevance | ?/5 | ?/5 | +/- |
-| Context Recall | ?/5 | ?/5 | +/- |
-| Completeness | ?/5 | ?/5 | +/- |
+Điểm trung bình variant:
 
-**Nhận xét:**
-> TODO: Variant 1 cải thiện ở câu nào? Tại sao?
-> Có câu nào kém hơn không? Tại sao?
+| Chỉ số | Baseline | Variant | Chênh lệch |
+|---|---:|---:|---:|
+| Faithfulness | 4.70/5 | 4.70/5 | +0.00 |
+| Relevance | 4.80/5 | 4.50/5 | -0.30 |
+| Context Recall | 5.00/5 | 5.00/5 | +0.00 |
+| Completeness | 4.20/5 | 4.20/5 | +0.00 |
 
-**Kết luận:**
-> TODO: Variant 1 có tốt hơn baseline không?
-> Bằng chứng là gì? (điểm số, câu hỏi cụ thể)
+Quan sát chính:
 
----
+1. Variant cải thiện cục bộ ở q06.
+2. Variant giảm chất lượng ở q09 và q10.
+3. Tập câu hỏi hiện tại cho thấy baseline ổn định hơn về tổng thể.
 
-## Variant 2 (nếu có thời gian)
+## 3. Kết luận A/B
 
-**Biến thay đổi:** ___________  
-**Config:**
-```
-# TODO
-```
+Kết quả thí nghiệm chưa cho thấy variant vượt baseline ở mức trung bình toàn tập. Baseline phù hợp làm cấu hình chính để trình diễn và nộp kết quả ổn định. Variant vẫn có giá trị tham khảo cho các trường hợp truy vấn kỹ thuật, nhưng cần tinh chỉnh thêm trước khi dùng làm cấu hình mặc định.
 
-**Scorecard Variant 2:**
-| Metric | Baseline | Variant 1 | Variant 2 | Best |
-|--------|----------|-----------|-----------|------|
-| Faithfulness | ? | ? | ? | ? |
-| Answer Relevance | ? | ? | ? | ? |
-| Context Recall | ? | ? | ? | ? |
-| Completeness | ? | ? | ? | ? |
+## 4. Hướng cải tiến tiếp theo
 
----
-
-## Tóm tắt học được
-
-> TODO (Sprint 4): Điền sau khi hoàn thành evaluation.
-
-1. **Lỗi phổ biến nhất trong pipeline này là gì?**
-   > _____________
-
-2. **Biến nào có tác động lớn nhất tới chất lượng?**
-   > _____________
-
-3. **Nếu có thêm 1 giờ, nhóm sẽ thử gì tiếp theo?**
-   > _____________
+1. Tinh chỉnh prompt cho nhóm câu hỏi thiếu ngữ cảnh để tăng độ nhất quán khi từ chối trả lời.
+2. Thử tách thí nghiệm từng biến độc lập để xác định tác động thực sự của rerank.
+3. Bổ sung kiểm soát completeness theo mẫu trả lời chuẩn cho các câu hỏi chính sách có nhiều điều kiện.

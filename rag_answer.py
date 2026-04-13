@@ -1,3 +1,4 @@
+# python -X utf8 rag_answer.py
 """
 rag_answer.py — Sprint 2 + Sprint 3: Retrieval & Grounded Answer
 ================================================================
@@ -22,8 +23,13 @@ Definition of Done Sprint 3:
 """
 
 import os
+import sys
 from typing import List, Dict, Any, Optional, Tuple
 from dotenv import load_dotenv
+
+# Đảm bảo stdout UTF-8 trên Windows
+if sys.stdout.encoding != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8")
 
 load_dotenv()
 
@@ -33,6 +39,12 @@ load_dotenv()
 
 TOP_K_SEARCH = 10    # Số chunk lấy từ vector store trước rerank (search rộng)
 TOP_K_SELECT = 3     # Số chunk gửi vào prompt sau rerank/select (top-3 sweet spot)
+
+# Nếu chunk tốt nhất có score thấp hơn ngưỡng này → abstain, không gọi LLM
+# Dense/sparse: [0,1] — 0.3 là ngưỡng thực nghiệm hợp lý
+# Hybrid RRF:   giá trị nhỏ hơn (~0.01) — set 0.0 để tắt abstain khi dùng hybrid
+# Rerank:       logit score, thường [-5, 5] — set 0.0 để lọc chunk không liên quan
+ABSTAIN_THRESHOLD = float(os.getenv("ABSTAIN_THRESHOLD", "0.3"))
 
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 
@@ -76,10 +88,40 @@ def retrieve_dense(query: str, top_k: int = TOP_K_SEARCH) -> List[Dict[str, Any]
         # Lưu ý: distances trong ChromaDB cosine = 1 - similarity
         # Score = 1 - distance
     """
-    raise NotImplementedError(
-        "TODO Sprint 2: Implement retrieve_dense().\n"
-        "Tham khảo comment trong hàm để biết cách query ChromaDB."
+    import chromadb
+    from index import get_embedding, CHROMA_DB_DIR
+
+    client = chromadb.PersistentClient(path=str(CHROMA_DB_DIR))
+    collection = client.get_or_create_collection(
+        name="rag_lab",
+        metadata={"hnsw:space": "cosine"},
     )
+
+    if collection.count() == 0:
+        raise RuntimeError(
+            "Collection 'rag_lab' trống. Hãy chạy 'python index.py' trước để build index."
+        )
+
+    query_embedding = get_embedding(query)
+    results = collection.query(
+        query_embeddings=[query_embedding],
+        n_results=top_k,
+        include=["documents", "metadatas", "distances"],
+    )
+
+    chunks = []
+    documents = results["documents"][0]
+    metadatas = results["metadatas"][0]
+    distances = results["distances"][0]
+
+    for doc, meta, dist in zip(documents, metadatas, distances):
+        chunks.append({
+            "text": doc,
+            "metadata": meta,
+            "score": 1 - dist,  # cosine distance → similarity
+        })
+
+    return chunks
 
 
 # =============================================================================
@@ -93,26 +135,56 @@ def retrieve_sparse(query: str, top_k: int = TOP_K_SEARCH) -> List[Dict[str, Any
 
     Mạnh ở: exact term, mã lỗi, tên riêng (ví dụ: "ERR-403", "P1", "refund")
     Hay hụt: câu hỏi paraphrase, đồng nghĩa
-
-    TODO Sprint 3 (nếu chọn hybrid):
-    1. Cài rank_bm25: pip install rank-bm25
-    2. Load tất cả chunks từ ChromaDB (hoặc rebuild từ docs)
-    3. Tokenize và tạo BM25Index
-    4. Query và trả về top_k kết quả
-
-    Gợi ý:
-        from rank_bm25 import BM25Okapi
-        corpus = [chunk["text"] for chunk in all_chunks]
-        tokenized_corpus = [doc.lower().split() for doc in corpus]
-        bm25 = BM25Okapi(tokenized_corpus)
-        tokenized_query = query.lower().split()
-        scores = bm25.get_scores(tokenized_query)
-        top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
     """
-    # TODO Sprint 3: Implement BM25 search
-    # Tạm thời return empty list
-    print("[retrieve_sparse] Chưa implement — Sprint 3")
-    return []
+    import chromadb
+    from rank_bm25 import BM25Okapi
+    from index import CHROMA_DB_DIR
+
+    # Load toàn bộ corpus từ ChromaDB
+    client = chromadb.PersistentClient(path=str(CHROMA_DB_DIR))
+    collection = client.get_or_create_collection(
+        name="rag_lab",
+        metadata={"hnsw:space": "cosine"},
+    )
+
+    if collection.count() == 0:
+        raise RuntimeError(
+            "Collection 'rag_lab' trống. Hãy chạy 'python index.py' trước để build index."
+        )
+
+    all_data = collection.get(include=["documents", "metadatas"])
+
+    all_docs = all_data["documents"]
+    all_metas = all_data["metadatas"]
+
+    # Tokenize corpus (lowercase, split)
+    tokenized_corpus = [doc.lower().split() for doc in all_docs]
+    bm25 = BM25Okapi(tokenized_corpus)
+
+    # Query
+    tokenized_query = query.lower().split()
+    scores = bm25.get_scores(tokenized_query)
+
+    # Lấy top_k index theo score giảm dần, chỉ giữ chunk có raw score > 0
+    top_indices = sorted(
+        [i for i in range(len(scores)) if scores[i] > 0],
+        key=lambda i: scores[i],
+        reverse=True,
+    )[:top_k]
+
+    # Normalize về [0, 1] dựa trên max raw score của TOÀN corpus
+    # để score phản ánh mức độ match tuyệt đối, không phải tương đối trong top-k
+    max_possible = max(scores) if len(scores) > 0 and max(scores) > 0 else 1.0
+
+    chunks = []
+    for idx in top_indices:
+        chunks.append({
+            "text": all_docs[idx],
+            "metadata": all_metas[idx],
+            "score": float(scores[idx]) / max_possible,  # [0,1] so sánh được với dense
+        })
+
+    return chunks
 
 
 # =============================================================================
@@ -148,10 +220,41 @@ def retrieve_hybrid(
     - Corpus có cả câu tự nhiên VÀ tên riêng, mã lỗi, điều khoản
     - Query như "Approval Matrix" khi doc đổi tên thành "Access Control SOP"
     """
-    # TODO Sprint 3: Implement hybrid RRF
-    # Tạm thời fallback về dense
-    print("[retrieve_hybrid] Chưa implement RRF — fallback về dense")
-    return retrieve_dense(query, top_k)
+    dense_results = retrieve_dense(query, top_k=top_k)
+    sparse_results = retrieve_sparse(query, top_k=top_k)
+
+    # Xây dựng map: text → chunk (dùng text làm key để dedup)
+    chunk_map: Dict[str, Dict[str, Any]] = {}
+    for chunk in dense_results + sparse_results:
+        key = chunk["text"]
+        if key not in chunk_map:
+            chunk_map[key] = chunk
+
+    # Tính rank từ mỗi danh sách (index 0 = rank 1)
+    dense_rank: Dict[str, int] = {c["text"]: i for i, c in enumerate(dense_results)}
+    sparse_rank: Dict[str, int] = {c["text"]: i for i, c in enumerate(sparse_results)}
+
+    # RRF score: dense_weight * 1/(60+rank_d) + sparse_weight * 1/(60+rank_s)
+    # Nếu không xuất hiện trong một danh sách → dùng rank = top_k (penalty)
+    rrf_scores: Dict[str, float] = {}
+    for text in chunk_map:
+        rd = dense_rank.get(text, top_k)
+        rs = sparse_rank.get(text, top_k)
+        rrf_scores[text] = (
+            dense_weight * (1.0 / (60 + rd)) +
+            sparse_weight * (1.0 / (60 + rs))
+        )
+
+    # Sort theo RRF score giảm dần
+    sorted_texts = sorted(rrf_scores, key=lambda t: rrf_scores[t], reverse=True)
+
+    results = []
+    for text in sorted_texts[:top_k]:
+        chunk = chunk_map[text].copy()
+        chunk["score"] = rrf_scores[text]  # ghi đè score bằng RRF score
+        results.append(chunk)
+
+    return results
 
 
 # =============================================================================
@@ -189,9 +292,32 @@ def rerank(
     - Dense/hybrid trả về nhiều chunk nhưng có noise
     - Muốn chắc chắn chỉ 3-5 chunk tốt nhất vào prompt
     """
-    # TODO Sprint 3: Implement rerank
-    # Tạm thời trả về top_k đầu tiên (không rerank)
-    return candidates[:top_k]
+    from sentence_transformers import CrossEncoder
+
+    # Lazy-load model (chỉ tải lần đầu, cache trong module scope)
+    if not hasattr(rerank, "_model"):
+        rerank._model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+    model: CrossEncoder = rerank._model
+
+    # Tạo pairs [query, chunk_text] để cross-encoder chấm điểm
+    pairs = [[query, c["text"]] for c in candidates]
+    scores = model.predict(pairs)  # numpy array
+
+    # Gắn rerank score và sort giảm dần
+    ranked = sorted(
+        zip(candidates, scores),
+        key=lambda x: x[1],
+        reverse=True,
+    )
+
+    results = []
+    for chunk, score in ranked[:top_k]:
+        chunk = chunk.copy()
+        chunk["score"] = float(score)  # ghi đè bằng cross-encoder score
+        results.append(chunk)
+
+    return results
 
 
 # =============================================================================
@@ -224,9 +350,75 @@ def transform_query(query: str, strategy: str = "expansion") -> List[str]:
     - Decomposition: query hỏi nhiều thứ một lúc
     - HyDE: query mơ hồ, search theo nghĩa không hiệu quả
     """
-    # TODO Sprint 3: Implement query transformation
-    # Tạm thời trả về query gốc
-    return [query]
+    import json
+    from openai import OpenAI
+
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+    if strategy == "expansion":
+        system_msg = (
+            "You are a search query assistant. "
+            "Given a user query, generate 2-3 alternative phrasings or closely related terms "
+            "that help retrieve the same information. "
+            "Output ONLY a JSON array of strings, no explanation."
+        )
+        user_msg = f"Query: {query}"
+
+    elif strategy == "decomposition":
+        system_msg = (
+            "You are a search query assistant. "
+            "Break down the following complex query into 2-3 simpler, focused sub-queries. "
+            "Each sub-query should target a distinct aspect of the original question. "
+            "Output ONLY a JSON array of strings, no explanation."
+        )
+        user_msg = f"Query: {query}"
+
+    elif strategy == "hyde":
+        # HyDE: sinh câu trả lời giả → embed câu trả lời thay vì query gốc
+        system_msg = (
+            "You are a knowledgeable assistant. "
+            "Write a concise, factual answer (2-4 sentences) to the following question "
+            "as if you were answering from an internal policy document. "
+            "Output ONLY the hypothetical answer text, no preamble."
+        )
+        user_msg = f"Question: {query}"
+        response = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0,
+            max_tokens=256,
+        )
+        hypothetical_doc = response.choices[0].message.content.strip()
+        # Trả về query gốc + hypothetical document để retrieve cả hai
+        return [query, hypothetical_doc]
+
+    else:
+        raise ValueError(f"strategy không hợp lệ: {strategy}. Chọn: expansion | decomposition | hyde")
+
+    response = client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        temperature=0,
+        max_tokens=256,
+    )
+    raw = response.choices[0].message.content.strip()
+
+    try:
+        alternatives = json.loads(raw)
+        if not isinstance(alternatives, list):
+            raise ValueError("Expected JSON array")
+    except (json.JSONDecodeError, ValueError):
+        # Fallback: trả về query gốc nếu parse thất bại
+        return [query]
+
+    # Luôn bao gồm query gốc để không bỏ sót
+    return [query] + [q for q in alternatives if q != query]
 
 
 # =============================================================================
@@ -268,58 +460,62 @@ def build_grounded_prompt(query: str, context_block: str) -> str:
     3. Citation: Gắn source/section khi có thể
     4. Short, clear, stable: Output ngắn, rõ, nhất quán
 
-    TODO Sprint 2:
-    Đây là prompt baseline. Trong Sprint 3, bạn có thể:
-    - Thêm hướng dẫn về format output (JSON, bullet points)
-    - Thêm ngôn ngữ phản hồi (tiếng Việt vs tiếng Anh)
-    - Điều chỉnh tone phù hợp với use case (CS helpdesk, IT support)
+    Trả về JSON gồm:
+      - "answer": câu trả lời với citation [N]
+      - "grounded_spans": list các câu/cụm từ NGUYÊN VĂN từ context đã dùng
     """
     prompt = f"""Answer only from the retrieved context below.
 If the context is insufficient to answer the question, say you do not know and do not make up information.
-Cite the source field (in brackets like [1]) when possible.
+Cite the source (in brackets like [1]) when using information from a chunk.
 Keep your answer short, clear, and factual.
 Respond in the same language as the question.
+
+You MUST return a JSON object with exactly these two fields:
+{{
+  "answer": "<your grounded answer with [N] citations>",
+  "grounded_spans": ["<exact phrase or sentence copied verbatim from the context that you relied on>", ...]
+}}
 
 Question: {query}
 
 Context:
-{context_block}
-
-Answer:"""
+{context_block}"""
     return prompt
 
 
-def call_llm(prompt: str) -> str:
+def call_llm(prompt: str) -> Tuple[str, List[str]]:
     """
-    Gọi LLM để sinh câu trả lời.
+    Gọi LLM, parse JSON response.
 
-    TODO Sprint 2:
-    Chọn một trong hai:
-
-    Option A — OpenAI (cần OPENAI_API_KEY):
-        from openai import OpenAI
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        response = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,     # temperature=0 để output ổn định, dễ đánh giá
-            max_tokens=512,
-        )
-        return response.choices[0].message.content
-
-    Option B — Google Gemini (cần GOOGLE_API_KEY):
-        import google.generativeai as genai
-        genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        response = model.generate_content(prompt)
-        return response.text
-
-    Lưu ý: Dùng temperature=0 hoặc thấp để output ổn định cho evaluation.
+    Returns:
+        (answer, grounded_spans)
+          - answer: câu trả lời với citation [N]
+          - grounded_spans: list câu/cụm từ nguyên văn từ context đã dùng
     """
-    raise NotImplementedError(
-        "TODO Sprint 2: Implement call_llm().\n"
-        "Chọn Option A (OpenAI) hoặc Option B (Gemini) trong TODO comment."
+    import json
+    from openai import OpenAI
+
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    response = client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+        max_tokens=768,
+        response_format={"type": "json_object"},
     )
+    raw = response.choices[0].message.content or ""
+    try:
+        data = json.loads(raw)
+        answer = data.get("answer", raw)
+        grounded_spans = data.get("grounded_spans", [])
+        if not isinstance(grounded_spans, list):
+            grounded_spans = []
+        # Lọc span rỗng
+        grounded_spans = [s for s in grounded_spans if isinstance(s, str) and s.strip()]
+    except (json.JSONDecodeError, AttributeError):
+        answer = raw
+        grounded_spans = []
+    return answer, grounded_spans
 
 
 def rag_answer(
@@ -394,6 +590,21 @@ def rag_answer(
     if verbose:
         print(f"[RAG] After select: {len(candidates)} chunks")
 
+    # --- Bước 2.5: Abstain nếu chunk tốt nhất dưới ngưỡng ---
+    best_score = candidates[0].get("score", 1.0) if candidates else 0.0
+    if not candidates or best_score < ABSTAIN_THRESHOLD:
+        if verbose:
+            print(f"[RAG] Abstain — best_score={best_score:.3f} < threshold={ABSTAIN_THRESHOLD}")
+        return {
+            "query": query,
+            "answer": "Không đủ dữ liệu để trả lời câu hỏi này.",
+            "sources": [],
+            "chunks_used": [],
+            "config": config,
+            "abstained": True,
+            "best_score": best_score,
+        }
+
     # --- Bước 3: Build context và prompt ---
     context_block = build_context_block(candidates)
     prompt = build_grounded_prompt(query, context_block)
@@ -402,7 +613,7 @@ def rag_answer(
         print(f"\n[RAG] Prompt:\n{prompt[:500]}...\n")
 
     # --- Bước 4: Generate ---
-    answer = call_llm(prompt)
+    answer, grounded_spans = call_llm(prompt)
 
     # --- Bước 5: Extract sources ---
     sources = list({
@@ -413,9 +624,12 @@ def rag_answer(
     return {
         "query": query,
         "answer": answer,
+        "grounded_spans": grounded_spans,
         "sources": sources,
         "chunks_used": candidates,
         "config": config,
+        "abstained": False,
+        "best_score": best_score,
     }
 
 
@@ -452,47 +666,239 @@ def compare_retrieval_strategies(query: str) -> None:
 
 
 # =============================================================================
-# MAIN — Demo và Test
+# GROUNDING HIGHLIGHT HELPERS
 # =============================================================================
 
-if __name__ == "__main__":
-    print("=" * 60)
-    print("Sprint 2 + 3: RAG Answer Pipeline")
-    print("=" * 60)
+def _highlight_chunk_html(
+    chunk_idx: int,
+    chunk: Dict[str, Any],
+    grounded_spans: List[str],
+) -> str:
+    """
+    Render một chunk thành HTML, tô màu vàng những câu/cụm từ
+    có trong grounded_spans (nguyên văn từ LLM).
 
-    # Test queries từ data/test_questions.json
-    test_queries = [
-        "SLA xử lý ticket P1 là bao lâu?",
-        "Khách hàng có thể yêu cầu hoàn tiền trong bao nhiêu ngày?",
-        "Ai phải phê duyệt để cấp quyền Level 3?",
-        "ERR-403-AUTH là lỗi gì?",  # Query không có trong docs → kiểm tra abstain
+    Màu vàng (#ffe066) = câu đóng góp trực tiếp vào câu trả lời.
+    """
+    import html as _html
+
+    meta = chunk.get("metadata", {})
+    score = chunk.get("score", 0)
+    src = meta.get("source", "?")
+    sec = meta.get("section", "")
+    text = chunk.get("text", "")
+
+    header = f"<b>[{chunk_idx}]</b> <code>{_html.escape(src)}</code>"
+    if sec:
+        header += f" | <i>{_html.escape(sec)}</i>"
+    header += f" | score={score:.3f}"
+
+    # Escape toàn bộ text, sau đó tô màu từng span
+    escaped = _html.escape(text)
+    highlighted_count = 0
+    for span in grounded_spans:
+        span = span.strip()
+        if not span:
+            continue
+        escaped_span = _html.escape(span)
+        if escaped_span in escaped:
+            escaped = escaped.replace(
+                escaped_span,
+                f'<mark style="background:#ffe066;padding:1px 3px;border-radius:3px">'
+                f'{escaped_span}</mark>',
+                1,
+            )
+            highlighted_count += 1
+
+    # Dấu hiệu chunk có đóng góp
+    border_color = "#f5a623" if highlighted_count > 0 else "#ddd"
+    body = escaped.replace("\n", "<br>")
+
+    return (
+        f'<div style="margin-bottom:14px;padding:10px 12px;'
+        f'border-left:4px solid {border_color};border-radius:4px;'
+        f'background:#fafafa">'
+        f'<p style="margin:0 0 6px;font-size:0.85em;color:#555">{header}</p>'
+        f'<p style="margin:0;font-size:0.88em;line-height:1.6">{body}</p>'
+        f'</div>'
+    )
+
+
+# =============================================================================
+# MAIN — Chatbot UI (Gradio)
+# =============================================================================
+
+# Câu hỏi mẫu từ data/test_questions.json
+_EXAMPLE_QUERIES = [
+    "SLA xử lý ticket P1 là bao lâu?",
+    "Khách hàng có thể yêu cầu hoàn tiền trong bao nhiêu ngày?",
+    "Ai phải phê duyệt để cấp quyền Level 3?",
+    "Sản phẩm kỹ thuật số có được hoàn tiền không?",
+    "Tài khoản bị khóa sau bao nhiêu lần đăng nhập sai?",
+    "Escalation trong sự cố P1 diễn ra như thế nào?",
+    "Nhân viên được làm remote tối đa mấy ngày mỗi tuần?",
+    "ERR-403-AUTH là lỗi gì và cách xử lý?",
+]
+
+
+def _chat_fn(
+    query: str,
+    retrieval_mode: str,
+    top_k_search: int,
+    top_k_select: int,
+    use_rerank: bool,
+    history: list,
+) -> Tuple[list, str, str]:
+    """
+    Hàm xử lý mỗi lượt chat, trả về:
+      - history mới (cho Chatbot component)
+      - sources markdown
+      - chunks HTML (có highlight câu đóng góp)
+    """
+    if not query.strip():
+        return history, "", ""
+
+    try:
+        result = rag_answer(
+            query=query.strip(),
+            retrieval_mode=retrieval_mode,
+            top_k_search=top_k_search,
+            top_k_select=top_k_select,
+            use_rerank=use_rerank,
+            verbose=False,
+        )
+        answer = result["answer"]
+        sources = result["sources"]
+        chunks = result["chunks_used"]
+        grounded_spans = result.get("grounded_spans", [])
+
+        # --- Format sources ---
+        if sources:
+            src_md = "\n".join(f"- `{s}`" for s in sorted(sources))
+        else:
+            src_md = "_Không có source_"
+
+        # --- Format chunks với highlight ---
+        if chunks:
+            chunk_html_parts = [
+                _highlight_chunk_html(i, c, grounded_spans)
+                for i, c in enumerate(chunks, 1)
+            ]
+            legend = (
+                '<p style="font-size:0.8em;color:#888;margin:0 0 10px">'
+                '<mark style="background:#ffe066;padding:1px 4px;border-radius:3px">▌</mark>'
+                " = câu trực tiếp đóng góp vào câu trả lời</p>"
+            )
+            chunks_html = legend + "".join(chunk_html_parts)
+        else:
+            chunks_html = "<i>Không có chunk</i>"
+
+    except Exception as e:
+        answer = f"Lỗi: {e}"
+        src_md = ""
+        chunks_html = ""
+
+    history = history + [
+        {"role": "user", "content": query},
+        {"role": "assistant", "content": answer},
     ]
+    return history, src_md, chunks_html
 
-    print("\n--- Sprint 2: Test Baseline (Dense) ---")
-    for query in test_queries:
-        print(f"\nQuery: {query}")
-        try:
-            result = rag_answer(query, retrieval_mode="dense", verbose=True)
-            print(f"Answer: {result['answer']}")
-            print(f"Sources: {result['sources']}")
-        except NotImplementedError:
-            print("Chưa implement — hoàn thành TODO trong retrieve_dense() và call_llm() trước.")
-        except Exception as e:
-            print(f"Lỗi: {e}")
 
-    # Uncomment sau khi Sprint 3 hoàn thành:
-    # print("\n--- Sprint 3: So sánh strategies ---")
-    # compare_retrieval_strategies("Approval Matrix để cấp quyền là tài liệu nào?")
-    # compare_retrieval_strategies("ERR-403-AUTH")
+def launch_chatbot() -> None:
+    import gradio as gr
 
-    print("\n\nViệc cần làm Sprint 2:")
-    print("  1. Implement retrieve_dense() — query ChromaDB")
-    print("  2. Implement call_llm() — gọi OpenAI hoặc Gemini")
-    print("  3. Chạy rag_answer() với 3+ test queries")
-    print("  4. Verify: output có citation không? Câu không có docs → abstain không?")
+    with gr.Blocks(title="RAG Chatbot — Day 08 Lab") as demo:
+        gr.Markdown(
+            "# RAG Chatbot\n"
+            "Hỏi về SLA, chính sách hoàn tiền, quyền truy cập, HR policy…\n"
+            "Câu trả lời được grounded từ tài liệu nội bộ, kèm citation."
+        )
 
-    print("\nViệc cần làm Sprint 3:")
-    print("  1. Chọn 1 trong 3 variants: hybrid, rerank, hoặc query transformation")
-    print("  2. Implement variant đó")
-    print("  3. Chạy compare_retrieval_strategies() để thấy sự khác biệt")
-    print("  4. Ghi lý do chọn biến đó vào docs/tuning-log.md")
+        with gr.Row():
+            # ── Left column: chat ────────────────────────────────────────────
+            with gr.Column(scale=3):
+                chatbot = gr.Chatbot(
+                    label="Hội thoại",
+                    height=480,
+                )
+                with gr.Row():
+                    query_box = gr.Textbox(
+                        placeholder="Nhập câu hỏi của bạn…",
+                        show_label=False,
+                        scale=5,
+                        autofocus=True,
+                    )
+                    send_btn = gr.Button("Gửi", variant="primary", scale=1)
+                clear_btn = gr.Button("Xóa lịch sử", size="sm")
+
+                gr.Markdown("**Câu hỏi mẫu** — click để điền vào ô nhập:")
+                example_btns = []
+                for i in range(0, len(_EXAMPLE_QUERIES), 2):
+                    with gr.Row():
+                        for q in _EXAMPLE_QUERIES[i:i+2]:
+                            btn = gr.Button(q, size="sm", variant="secondary")
+                            btn.click(fn=lambda v=q: v, outputs=query_box)
+                            example_btns.append(btn)
+
+            # ── Right column: settings + debug ───────────────────────────────
+            with gr.Column(scale=2):
+                gr.Markdown("### Cấu hình pipeline")
+                retrieval_mode = gr.Radio(
+                    choices=["dense", "hybrid", "sparse"],
+                    value="dense",
+                    label="Retrieval mode",
+                    info="dense=vector search | hybrid=dense+BM25 | sparse=BM25 only",
+                )
+                top_k_search = gr.Slider(
+                    minimum=3, maximum=20, step=1, value=TOP_K_SEARCH,
+                    label=f"Top-K search (search rộng)",
+                )
+                top_k_select = gr.Slider(
+                    minimum=1, maximum=10, step=1, value=TOP_K_SELECT,
+                    label="Top-K select (đưa vào prompt)",
+                )
+                use_rerank = gr.Checkbox(
+                    value=False,
+                    label="Rerank (cross-encoder) — Sprint 3",
+                )
+
+                gr.Markdown("### Sources")
+                sources_box = gr.Markdown(value="_Chưa có câu hỏi_")
+
+                with gr.Accordion("Chunks debug (câu highlight = đóng góp vào trả lời)", open=False):
+                    chunks_box = gr.HTML(value="")
+
+        # ── State ─────────────────────────────────────────────────────────────
+        state_history = gr.State([])
+
+        # ── Submit handlers ───────────────────────────────────────────────────
+        submit_inputs = [
+            query_box, retrieval_mode, top_k_search, top_k_select,
+            use_rerank, state_history,
+        ]
+
+        def _submit(q, mode, k_s, k_sel, rerank, hist):
+            new_hist, src, cks = _chat_fn(q, mode, k_s, k_sel, rerank, hist)
+            return new_hist, new_hist, src, cks, ""
+
+        for trigger in [send_btn.click, query_box.submit]:
+            trigger(
+                fn=_submit,
+                inputs=submit_inputs,
+                outputs=[state_history, chatbot, sources_box, chunks_box, query_box],
+            )
+
+        clear_btn.click(
+            fn=lambda: ([], [], "_Chưa có câu hỏi_", ""),
+            outputs=[state_history, chatbot, sources_box, chunks_box],
+        )
+
+    demo.launch(inbrowser=True, theme=gr.themes.Soft())
+
+
+if __name__ == "__main__":
+    launch_chatbot()
+
+
+

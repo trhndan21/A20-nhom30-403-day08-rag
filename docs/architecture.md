@@ -1,136 +1,105 @@
-# Architecture — RAG Pipeline (Day 08 Lab)
+# Kiến trúc Hệ Thống RAG
 
-> Template: Điền vào các mục này khi hoàn thành từng sprint.
-> Deliverable của Documentation Owner.
+## 1. Tổng quan
 
-## 1. Tổng quan kiến trúc
+Hệ thống được xây dựng để trả lời câu hỏi nghiệp vụ nội bộ cho các nhóm Chăm sóc khách hàng và Hỗ trợ công nghệ thông tin. Mô hình vận hành theo kiến trúc RAG: tài liệu được chuẩn hóa và lập chỉ mục trước, sau đó hệ thống truy hồi ngữ cảnh liên quan theo truy vấn, cuối cùng sinh câu trả lời bám sát ngữ cảnh có dẫn nguồn.
 
+Luồng dữ liệu tổng quát:
+
+```text
+Tài liệu thô
+  -> Tiền xử lý và chia đoạn
+  -> Sinh embedding và lưu chỉ mục vào ChromaDB
+  -> Truy hồi ngữ cảnh theo câu hỏi
+  -> Tùy chọn xếp hạng lại ngữ cảnh
+  -> Tạo prompt có ràng buộc grounding
+  -> Sinh câu trả lời kèm nguồn trích dẫn
 ```
-[Raw Docs]
-    ↓
-[index.py: Preprocess → Chunk → Embed → Store]
-    ↓
-[ChromaDB Vector Store]
-    ↓
-[rag_answer.py: Query → Retrieve → Rerank → Generate]
-    ↓
-[Grounded Answer + Citation]
-```
 
-**Mô tả ngắn gọn:**
-> TODO: Mô tả hệ thống trong 2-3 câu. Nhóm xây gì? Cho ai dùng? Giải quyết vấn đề gì?
+## 2. Pipeline lập chỉ mục
 
----
+Nguồn dữ liệu gồm năm tài liệu chính sách và quy trình trong thư mục dữ liệu nội bộ. Mỗi tài liệu được:
 
-## 2. Indexing Pipeline (Sprint 1)
+1. Tiền xử lý để trích xuất metadata.
+2. Chia đoạn theo tiêu đề và đoạn văn.
+3. Sinh embedding cho từng đoạn.
+4. Lưu vào ChromaDB để phục vụ truy hồi.
 
-### Tài liệu được index
-| File | Nguồn | Department | Số chunk |
-|------|-------|-----------|---------|
-| `policy_refund_v4.txt` | policy/refund-v4.pdf | CS | TODO |
-| `sla_p1_2026.txt` | support/sla-p1-2026.pdf | IT | TODO |
-| `access_control_sop.txt` | it/access-control-sop.md | IT Security | TODO |
-| `it_helpdesk_faq.txt` | support/helpdesk-faq.md | IT | TODO |
-| `hr_leave_policy.txt` | hr/leave-policy-2026.pdf | HR | TODO |
+Thông số lập chỉ mục:
 
-### Quyết định chunking
-| Tham số | Giá trị | Lý do |
-|---------|---------|-------|
-| Chunk size | TODO tokens | TODO |
-| Overlap | TODO tokens | TODO |
-| Chunking strategy | Heading-based / paragraph-based | TODO |
-| Metadata fields | source, section, effective_date, department, access | Phục vụ filter, freshness, citation |
+| Thành phần | Cấu hình |
+|---|---|
+| Kích thước đoạn | 400 token (xấp xỉ) |
+| Độ chồng lấp | 80 token (xấp xỉ) |
+| Chiến lược chia đoạn | Theo tiêu đề kết hợp theo đoạn văn |
+| Metadata chính | source, section, effective_date, department, access |
+| Kho vector | ChromaDB (PersistentClient) |
+| Độ đo tương đồng | Cosine |
+| Embedding model | all-MiniLM-L6-v2 |
 
-### Embedding model
-- **Model**: TODO (OpenAI text-embedding-3-small / paraphrase-multilingual-MiniLM-L12-v2)
-- **Vector store**: ChromaDB (PersistentClient)
-- **Similarity metric**: Cosine
+## 3. Pipeline truy hồi
 
----
+### Cấu hình baseline
 
-## 3. Retrieval Pipeline (Sprint 2 + 3)
-
-### Baseline (Sprint 2)
-| Tham số | Giá trị |
-|---------|---------|
-| Strategy | Dense (embedding similarity) |
+| Thành phần | Cấu hình |
+|---|---|
+| Chế độ truy hồi | Dense retrieval |
 | Top-k search | 10 |
 | Top-k select | 3 |
-| Rerank | Không |
+| Rerank | Không dùng |
 
-### Variant (Sprint 3)
-| Tham số | Giá trị | Thay đổi so với baseline |
-|---------|---------|------------------------|
-| Strategy | TODO (hybrid / dense) | TODO |
-| Top-k search | TODO | TODO |
-| Top-k select | TODO | TODO |
-| Rerank | TODO (cross-encoder / MMR) | TODO |
-| Query transform | TODO (expansion / HyDE / decomposition) | TODO |
+### Cấu hình variant
 
-**Lý do chọn variant này:**
-> TODO: Giải thích tại sao chọn biến này để tune.
-> Ví dụ: "Chọn hybrid vì corpus có cả câu tự nhiên (policy) lẫn mã lỗi và tên chuyên ngành (SLA ticket P1, ERR-403)."
+| Thành phần | Cấu hình |
+|---|---|
+| Chế độ truy hồi | Hybrid (dense + BM25, hợp nhất bằng RRF) |
+| Top-k search | 10 |
+| Top-k select | 3 |
+| Rerank | Cross-encoder |
+| Query transform | Không dùng |
 
----
+Mục tiêu của variant là kiểm tra khả năng tăng chất lượng truy hồi ở các câu hỏi có từ khóa kỹ thuật hoặc yêu cầu ngữ cảnh đa đoạn.
 
-## 4. Generation (Sprint 2)
+## 4. Pipeline sinh câu trả lời
 
-### Grounded Prompt Template
-```
-Answer only from the retrieved context below.
-If the context is insufficient, say you do not know.
-Cite the source field when possible.
-Keep your answer short, clear, and factual.
+Hệ thống sử dụng prompt có ràng buộc:
 
-Question: {query}
+1. Chỉ trả lời từ ngữ cảnh đã truy hồi.
+2. Không đủ dữ liệu thì từ chối trả lời thay vì suy diễn.
+3. Ưu tiên câu trả lời ngắn gọn, rõ ràng.
+4. Có trích dẫn nguồn theo thứ tự đoạn ngữ cảnh.
 
-Context:
-[1] {source} | {section} | score={score}
-{chunk_text}
+Cấu hình sinh câu trả lời:
 
-[2] ...
-
-Answer:
-```
-
-### LLM Configuration
 | Tham số | Giá trị |
-|---------|---------|
-| Model | TODO (gpt-4o-mini / gemini-1.5-flash) |
-| Temperature | 0 (để output ổn định cho eval) |
+|---|---|
+| Mô hình | gpt-4o-mini |
+| Temperature | 0 |
 | Max tokens | 512 |
 
----
+## 5. Kiểm soát lỗi vận hành
 
-## 5. Failure Mode Checklist
+Các điểm cần kiểm tra khi chất lượng giảm:
 
-> Dùng khi debug — kiểm tra lần lượt: index → retrieval → generation
+1. Lập chỉ mục: dữ liệu hoặc metadata thiếu/không đồng nhất.
+2. Chia đoạn: đoạn bị cắt mất ý hoặc trùng lặp ngữ cảnh quá nhiều.
+3. Truy hồi: không đưa được nguồn kỳ vọng vào top-k.
+4. Sinh câu trả lời: câu trả lời không bám ngữ cảnh hoặc thiếu thành phần quan trọng.
+5. Độ dài ngữ cảnh: quá dài dẫn đến giảm tập trung thông tin.
 
-| Failure Mode | Triệu chứng | Cách kiểm tra |
-|-------------|-------------|---------------|
-| Index lỗi | Retrieve về docs cũ / sai version | `inspect_metadata_coverage()` trong index.py |
-| Chunking tệ | Chunk cắt giữa điều khoản | `list_chunks()` và đọc text preview |
-| Retrieval lỗi | Không tìm được expected source | `score_context_recall()` trong eval.py |
-| Generation lỗi | Answer không grounded / bịa | `score_faithfulness()` trong eval.py |
-| Token overload | Context quá dài → lost in the middle | Kiểm tra độ dài context_block |
-
----
-
-## 6. Diagram (tùy chọn)
-
-> TODO: Vẽ sơ đồ pipeline nếu có thời gian. Có thể dùng Mermaid hoặc drawio.
+## 6. Sơ đồ kiến trúc
 
 ```mermaid
 graph LR
-    A[User Query] --> B[Query Embedding]
-    B --> C[ChromaDB Vector Search]
-    C --> D[Top-10 Candidates]
-    D --> E{Rerank?}
-    E -->|Yes| F[Cross-Encoder]
-    E -->|No| G[Top-3 Select]
+    A[Câu hỏi người dùng] --> B[Embedding truy vấn]
+    B --> C[Truy hồi trên ChromaDB]
+    C --> D[Danh sách ngữ cảnh ứng viên]
+    D --> E{Có rerank}
+    E -->|Có| F[Cross-encoder rerank]
+    E -->|Không| G[Chọn top-k trực tiếp]
     F --> G
-    G --> H[Build Context Block]
-    H --> I[Grounded Prompt]
+    G --> H[Tạo context block]
+    H --> I[Tạo grounded prompt]
     I --> J[LLM]
-    J --> K[Answer + Citation]
+    J --> K[Câu trả lời có trích dẫn]
 ```
