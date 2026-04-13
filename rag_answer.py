@@ -42,8 +42,8 @@ TOP_K_SELECT = 3     # Số chunk gửi vào prompt sau rerank/select (top-3 swe
 
 # Nếu chunk tốt nhất có score thấp hơn ngưỡng này → abstain, không gọi LLM
 # Dense/sparse: [0,1] — 0.3 là ngưỡng thực nghiệm hợp lý
-# Hybrid RRF:   giá trị nhỏ hơn (~0.01) — set 0.0 để tắt abstain khi dùng hybrid
-# Rerank:       logit score, thường [-5, 5] — set 0.0 để lọc chunk không liên quan
+# Hybrid RRF:   giá trị nhỏ hơn (~0.01), dùng ABSTAIN_THRESHOLD_HYBRID (mặc định 0.0)
+# Rerank:       logit score, thường [-5, 5], dùng ABSTAIN_THRESHOLD_RERANK (mặc định 0.0)
 ABSTAIN_THRESHOLD = float(os.getenv("ABSTAIN_THRESHOLD", "0.3"))
 
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
@@ -230,9 +230,9 @@ def retrieve_hybrid(
         if key not in chunk_map:
             chunk_map[key] = chunk
 
-    # Tính rank từ mỗi danh sách (index 0 = rank 1)
-    dense_rank: Dict[str, int] = {c["text"]: i for i, c in enumerate(dense_results)}
-    sparse_rank: Dict[str, int] = {c["text"]: i for i, c in enumerate(sparse_results)}
+    # Tính rank từ mỗi danh sách (rank bắt đầu từ 1)
+    dense_rank: Dict[str, int] = {c["text"]: i + 1 for i, c in enumerate(dense_results)}
+    sparse_rank: Dict[str, int] = {c["text"]: i + 1 for i, c in enumerate(sparse_results)}
 
     # RRF score: dense_weight * 1/(60+rank_d) + sparse_weight * 1/(60+rank_s)
     # Nếu không xuất hiện trong một danh sách → dùng rank = top_k (penalty)
@@ -591,10 +591,24 @@ def rag_answer(
         print(f"[RAG] After select: {len(candidates)} chunks")
 
     # --- Bước 2.5: Abstain nếu chunk tốt nhất dưới ngưỡng ---
+    # Ngưỡng cần phụ thuộc thang điểm của score theo từng mode.
+    # - Dense/sparse: cosine/BM25 normalized ~ [0,1]
+    # - Hybrid RRF: score rất nhỏ (~0.01)
+    # - Rerank: cross-encoder logit có thể âm/dương
+    if use_rerank:
+        abstain_threshold = float(os.getenv("ABSTAIN_THRESHOLD_RERANK", "0.0"))
+    elif retrieval_mode == "hybrid":
+        abstain_threshold = float(os.getenv("ABSTAIN_THRESHOLD_HYBRID", "0.0"))
+    else:
+        abstain_threshold = ABSTAIN_THRESHOLD
+
     best_score = candidates[0].get("score", 1.0) if candidates else 0.0
-    if not candidates or best_score < ABSTAIN_THRESHOLD:
+    if not candidates or best_score < abstain_threshold:
         if verbose:
-            print(f"[RAG] Abstain — best_score={best_score:.3f} < threshold={ABSTAIN_THRESHOLD}")
+            print(
+                f"[RAG] Abstain — best_score={best_score:.3f} < threshold={abstain_threshold} "
+                f"(mode={retrieval_mode}, rerank={use_rerank})"
+            )
         return {
             "query": query,
             "answer": "Không đủ dữ liệu để trả lời câu hỏi này.",

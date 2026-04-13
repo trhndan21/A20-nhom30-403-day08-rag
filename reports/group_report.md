@@ -25,12 +25,14 @@ Nhận xét:
 1. Baseline ổn định hơn về chất lượng tổng thể.
 2. Variant cải thiện cục bộ ở một số câu hỏi nhưng chưa bền vững trên toàn bộ tập đánh giá.
 3. Context Recall cao ở cả hai cấu hình cho thấy khả năng truy hồi nguồn tốt; phần cần tối ưu thêm nằm ở lớp sinh câu trả lời và độ đầy đủ nội dung.
+4. Trong lần chạy hiện tại, nhóm thử đồng thời hybrid và rerank; vì vậy cần thêm một vòng tách biến để kết luận rõ hơn mức đóng góp của từng thành phần.
 
 ## 4. Phân tích và bài học
 
 1. Nguyên tắc A/B một biến thay đổi là cần thiết để đọc đúng tác động của từng quyết định kỹ thuật.
 2. Truy hồi tốt chưa đồng nghĩa câu trả lời tốt; cần kiểm soát chặt tính đầy đủ và mức độ bám ngữ cảnh khi sinh đáp án.
 3. Với nhóm câu hỏi thiếu dữ liệu, quy tắc từ chối trả lời cần rõ ràng và nhất quán hơn để tránh giảm điểm relevance/completeness.
+4. Cần bổ sung một vòng thí nghiệm tách biến để xác nhận rõ đóng góp riêng của hybrid và rerank.
 
 ## 5. Định hướng cải tiến
 

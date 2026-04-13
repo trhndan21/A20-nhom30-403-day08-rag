@@ -47,6 +47,7 @@ Thông số lập chỉ mục:
 | Top-k search | 10 |
 | Top-k select | 3 |
 | Rerank | Không dùng |
+| Ngưỡng abstain | 0.3 |
 
 ### Cấu hình variant
 
@@ -57,6 +58,7 @@ Thông số lập chỉ mục:
 | Top-k select | 3 |
 | Rerank | Cross-encoder |
 | Query transform | Không dùng |
+| Ngưỡng abstain | 0.0 (theo thang điểm hybrid/rerank) |
 
 Mục tiêu của variant là kiểm tra khả năng tăng chất lượng truy hồi ở các câu hỏi có từ khóa kỹ thuật hoặc yêu cầu ngữ cảnh đa đoạn.
 
@@ -98,8 +100,10 @@ graph LR
     E -->|Có| F[Cross-encoder rerank]
     E -->|Không| G[Chọn top-k trực tiếp]
     F --> G
-    G --> H[Tạo context block]
-    H --> I[Tạo grounded prompt]
-    I --> J[LLM]
-    J --> K[Câu trả lời có trích dẫn]
+  G --> H{Đạt ngưỡng abstain}
+  H -->|Không| I[Từ chối trả lời: không đủ dữ liệu]
+  H -->|Có| J[Tạo context block]
+  J --> K[Tạo grounded prompt]
+  K --> L[LLM]
+  L --> M[Câu trả lời có trích dẫn]
 ```
